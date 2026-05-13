@@ -29,9 +29,35 @@ input {
   font: inherit;
 }
 
+@font-face {
+  font-family: "UD Digi Kyokasho Web";
+  src:
+    local("UD Digi Kyokasho N-R"),
+    local("UD Digi Kyokasho NP-R"),
+    local("UD Digi Kyokasho NK-R"),
+    local("UD Digi Kyokasho");
+  font-weight: 400;
+  font-style: normal;
+  font-display: swap;
+}
+
+@font-face {
+  font-family: "UD Digi Kyokasho Web";
+  src:
+    local("UD Digi Kyokasho N-B"),
+    local("UD Digi Kyokasho NP-B"),
+    local("UD Digi Kyokasho NK-B"),
+    local("UD Digi Kyokasho Bold");
+  font-weight: 700;
+  font-style: normal;
+  font-display: swap;
+}
+
 .font-kanji {
   font-family:
-    "Noto Sans JP", "Be Vietnam Pro", ui-sans-serif, system-ui, sans-serif;
+    "UD Digi Kyokasho Web", "UD Digi Kyokasho N-R", "UD Digi Kyokasho NP-R",
+    "UD Digi Kyokasho NK-R", "Noto Sans JP", "Be Vietnam Pro", ui-sans-serif,
+    system-ui, sans-serif;
 }
 
 .font-vietnamese {

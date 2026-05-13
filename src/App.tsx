@@ -30,7 +30,7 @@ const stripVietnameseTone = (value: string) =>
   value
     .normalize('NFD')
     .replace(/[\u0300-\u036f]/g, '')
-    .replace(/[đĐ]/g, 'd')
+    .replace(/[\u0111\u0110]/g, 'd')
     .toLowerCase()
     .replace(/[^a-z0-9\s-]/g, ' ')
     .replace(/\s+/g, ' ')
@@ -73,6 +73,9 @@ function App() {
   const [statuses, setStatuses] = useState<Record<number, CardStatus>>(
     getInitialStatuses,
   )
+  const [learnQueue, setLearnQueue] = useState<KanjiCard[]>(() =>
+    shuffleCards(cards),
+  )
   const [testQueue, setTestQueue] = useState<KanjiCard[]>(() => shuffleCards(cards))
   const [testIndex, setTestIndex] = useState(0)
   const [answer, setAnswer] = useState('')
@@ -100,14 +103,35 @@ function App() {
     })
   }, [query])
 
-  const effectiveIndex = filteredCards.length
-    ? Math.min(currentIndex, filteredCards.length - 1)
+  const filteredCardIds = useMemo(
+    () => new Set(filteredCards.map((card) => card.id)),
+    [filteredCards],
+  )
+  const pendingLearnCards = useMemo(
+    () =>
+      learnQueue.filter(
+        (card) =>
+          filteredCardIds.has(card.id) && statuses[card.id] !== 'known',
+      ),
+    [filteredCardIds, learnQueue, statuses],
+  )
+
+  useEffect(() => {
+    setCurrentIndex((index) =>
+      pendingLearnCards.length
+        ? Math.min(index, pendingLearnCards.length - 1)
+        : 0,
+    )
+  }, [pendingLearnCards.length])
+
+  const effectiveIndex = pendingLearnCards.length
+    ? Math.min(currentIndex, pendingLearnCards.length - 1)
     : 0
-  const currentCard = filteredCards[effectiveIndex] ?? cards[0]
+  const currentCard = pendingLearnCards[effectiveIndex] ?? cards[0]
   const currentTestCard = testQueue[testIndex]
-  const knownCount = Object.values(statuses).filter((status) => status === 'known').length
-  const learningCount = Object.values(statuses).filter(
-    (status) => status === 'learning',
+  const knownCount = cards.filter((card) => statuses[card.id] === 'known').length
+  const learningCount = cards.filter(
+    (card) => statuses[card.id] === 'learning',
   ).length
   const testFinished = testIndex >= testQueue.length
   const accuracy = score.total ? Math.round((score.correct / score.total) * 100) : 0
@@ -120,15 +144,52 @@ function App() {
   const moveCard = (direction: 1 | -1) => {
     setCurrentIndex((index) => {
       const nextIndex = index + direction
-      if (nextIndex < 0) return filteredCards.length - 1
-      if (nextIndex >= filteredCards.length) return 0
+      if (!pendingLearnCards.length) return 0
+      if (nextIndex < 0) return pendingLearnCards.length - 1
+      if (nextIndex >= pendingLearnCards.length) return 0
       return nextIndex
     })
     setIsFlipped(false)
   }
 
-  const resetTest = (pool: KanjiCard[] = cards) => {
-    setTestQueue(shuffleCards(pool.length ? pool : cards))
+  const shuffleLearning = () => {
+    setLearnQueue(shuffleCards(cards))
+    setCurrentIndex(0)
+    setIsFlipped(false)
+  }
+
+  const markStillLearning = (card: KanjiCard) => {
+    setCardStatus(card, 'learning')
+    setLearnQueue((queue) => {
+      const remaining = queue.filter((item) => item.id !== card.id)
+      const insertAt = Math.min(currentIndex + 4, remaining.length)
+
+      return [
+        ...remaining.slice(0, insertAt),
+        card,
+        ...remaining.slice(insertAt),
+      ]
+    })
+    setIsFlipped(false)
+  }
+
+  const markKnown = (card: KanjiCard) => {
+    setCardStatus(card, 'known')
+    setIsFlipped(false)
+  }
+
+  const restartLearning = () => {
+    setStatuses({})
+    setLearnQueue(shuffleCards(cards))
+    setCurrentIndex(0)
+    setIsFlipped(false)
+  }
+
+  const resetTest = (pool?: KanjiCard[]) => {
+    const activeCards = cards.filter((card) => statuses[card.id] !== 'known')
+    const sourceCards = pool ?? (activeCards.length ? activeCards : cards)
+
+    setTestQueue(shuffleCards(sourceCards.length ? sourceCards : cards))
     setTestIndex(0)
     setAnswer('')
     setFeedback(null)
@@ -154,7 +215,11 @@ function App() {
       setCardStatus(currentTestCard, 'known')
     } else {
       setCardStatus(currentTestCard, 'learning')
-      setMissed((previous) => [...previous, currentTestCard])
+      setMissed((previous) =>
+        previous.some((card) => card.id === currentTestCard.id)
+          ? previous
+          : [...previous, currentTestCard],
+      )
     }
   }
 
@@ -242,54 +307,98 @@ function App() {
                     Learn mode
                   </p>
                   <p className="mt-1 text-sm text-[#625d57] dark:text-[#bab5ad]">
-                    Click the card to reveal the Han Viet answer.
+                    Shuffled review keeps missed cards in rotation until learned.
                   </p>
                 </div>
-                <input
-                  value={query}
-                  onChange={(event) => {
-                    setQuery(event.target.value)
-                    setCurrentIndex(0)
-                    setIsFlipped(false)
-                  }}
-                  placeholder="Search kanji or Han Viet"
-                  className="h-11 w-full border border-[#d8d1c7] bg-white px-4 text-sm outline-none transition placeholder:text-[#9b948c] focus:border-[#16171d] dark:border-[#343844] dark:bg-[#101116] dark:placeholder:text-[#746f6b] dark:focus:border-[#f3f0ea] md:w-72"
-                />
+                <div className="flex w-full flex-col gap-2 sm:flex-row md:w-auto">
+                  <button
+                    type="button"
+                    onClick={shuffleLearning}
+                    className="h-11 border border-[#ded8cf] px-4 text-sm font-semibold transition hover:border-[#16171d] dark:border-[#343844] dark:hover:border-[#f3f0ea]"
+                  >
+                    Shuffle
+                  </button>
+                  <input
+                    value={query}
+                    onChange={(event) => {
+                      setQuery(event.target.value)
+                      setCurrentIndex(0)
+                      setIsFlipped(false)
+                    }}
+                    placeholder="Search kanji or Han Viet"
+                    className="h-11 w-full border border-[#d8d1c7] bg-white px-4 text-sm outline-none transition placeholder:text-[#9b948c] focus:border-[#16171d] dark:border-[#343844] dark:bg-[#101116] dark:placeholder:text-[#746f6b] dark:focus:border-[#f3f0ea] md:w-72"
+                  />
+                </div>
               </div>
 
-              <button
-                type="button"
-                onClick={() => setIsFlipped((value) => !value)}
-                className="group grid min-h-[330px] flex-1 place-items-center border border-[#16171d] bg-[#fbf9f7] px-6 py-10 text-center transition hover:bg-white dark:border-[#f3f0ea] dark:bg-[#101116] dark:hover:bg-[#171a22]"
-              >
-                <div>
-                  <p className="font-mono text-xs uppercase tracking-[0.3em] text-[#9b2f2f] dark:text-[#e3a66d]">
-                    Card {filteredCards.length ? effectiveIndex + 1 : 0} of{' '}
-                    {filteredCards.length}
-                  </p>
-                  <div
-                    className={`mt-6 leading-none ${
-                      isFlipped
-                        ? 'font-vietnamese text-6xl font-bold md:text-8xl'
-                        : 'font-kanji text-[8rem] font-black md:text-[11rem]'
-                    }`}
-                  >
-                    {isFlipped ? currentCard.hanViet : currentCard.kanji}
+              {pendingLearnCards.length ? (
+                <button
+                  type="button"
+                  onClick={() => setIsFlipped((value) => !value)}
+                  className="group grid min-h-[330px] flex-1 place-items-center border border-[#16171d] bg-[#fbf9f7] px-6 py-10 text-center transition hover:bg-white dark:border-[#f3f0ea] dark:bg-[#101116] dark:hover:bg-[#171a22]"
+                >
+                  <div>
+                    <p className="font-mono text-xs uppercase tracking-[0.3em] text-[#9b2f2f] dark:text-[#e3a66d]">
+                      Queue {effectiveIndex + 1} of {pendingLearnCards.length}
+                    </p>
+                    <div
+                      className={`mt-6 leading-none ${
+                        isFlipped
+                          ? 'font-vietnamese text-6xl font-bold md:text-8xl'
+                          : 'font-kanji text-[8rem] font-bold md:text-[11rem]'
+                      }`}
+                    >
+                      {isFlipped ? currentCard.hanViet : currentCard.kanji}
+                    </div>
+                    <p className="mt-7 text-sm text-[#625d57] dark:text-[#bab5ad]">
+                      {isFlipped ? (
+                        <span className="font-kanji">{currentCard.kanji}</span>
+                      ) : (
+                        'Reveal Han Viet'
+                      )}
+                    </p>
                   </div>
-                  <p className="mt-7 text-sm text-[#625d57] dark:text-[#bab5ad]">
-                    {isFlipped ? (
-                      <span className="font-kanji">{currentCard.kanji}</span>
-                    ) : (
-                      'Reveal Han Viet'
-                    )}
-                  </p>
+                </button>
+              ) : (
+                <div className="grid min-h-[330px] flex-1 place-items-center border border-[#16171d] bg-[#fbf9f7] px-6 py-10 text-center dark:border-[#f3f0ea] dark:bg-[#101116]">
+                  <div className="max-w-xl">
+                    <p className="font-mono text-xs uppercase tracking-[0.3em] text-[#9b2f2f] dark:text-[#e3a66d]">
+                      Learning complete
+                    </p>
+                    <h2 className="font-vietnamese mt-5 text-5xl font-bold leading-tight">
+                      {filteredCards.length
+                        ? 'You learned every card in this set.'
+                        : 'No cards match this search.'}
+                    </h2>
+                    <p className="mt-4 text-[#625d57] dark:text-[#bab5ad]">
+                      Known cards leave the learning queue. Cards marked still
+                      learning come back later until you mark them known.
+                    </p>
+                    <div className="mt-7 grid gap-3 sm:grid-cols-2">
+                      <button
+                        type="button"
+                        onClick={() => setQuery('')}
+                        className="border border-[#ded8cf] px-5 py-3 text-sm font-semibold transition hover:border-[#16171d] dark:border-[#343844] dark:hover:border-[#f3f0ea]"
+                      >
+                        Clear search
+                      </button>
+                      <button
+                        type="button"
+                        onClick={restartLearning}
+                        className="border border-[#16171d] bg-[#16171d] px-5 py-3 text-sm font-semibold text-white transition hover:bg-[#2a2c34] dark:border-[#f3f0ea] dark:bg-[#f3f0ea] dark:text-[#101116]"
+                      >
+                        Study all again
+                      </button>
+                    </div>
+                  </div>
                 </div>
-              </button>
+              )}
 
               <div className="mt-5 grid gap-3 md:grid-cols-[auto_1fr_auto] md:items-center">
                 <button
                   type="button"
                   onClick={() => moveCard(-1)}
+                  disabled={!pendingLearnCards.length}
                   className="border border-[#ded8cf] px-5 py-3 text-sm font-semibold transition hover:border-[#16171d] dark:border-[#343844] dark:hover:border-[#f3f0ea]"
                 >
                   Previous
@@ -297,17 +406,16 @@ function App() {
                 <div className="grid grid-cols-2 gap-3">
                   <button
                     type="button"
-                    onClick={() => setCardStatus(currentCard, 'learning')}
+                    onClick={() => markStillLearning(currentCard)}
+                    disabled={!pendingLearnCards.length}
                     className="border border-[#c9a44a] bg-[#fff7df] px-5 py-3 text-sm font-semibold text-[#6f5210] transition hover:bg-[#ffefbd] dark:border-[#806729] dark:bg-[#2a2415] dark:text-[#f2d27d]"
                   >
                     Still learning
                   </button>
                   <button
                     type="button"
-                    onClick={() => {
-                      setCardStatus(currentCard, 'known')
-                      moveCard(1)
-                    }}
+                    onClick={() => markKnown(currentCard)}
+                    disabled={!pendingLearnCards.length}
                     className="border border-[#1f6f54] bg-[#e7f6ed] px-5 py-3 text-sm font-semibold text-[#17523f] transition hover:bg-[#d4f0df] dark:border-[#39765f] dark:bg-[#13251e] dark:text-[#aee6cd]"
                   >
                     I know this
@@ -316,6 +424,7 @@ function App() {
                 <button
                   type="button"
                   onClick={() => moveCard(1)}
+                  disabled={!pendingLearnCards.length}
                   className="border border-[#ded8cf] px-5 py-3 text-sm font-semibold transition hover:border-[#16171d] dark:border-[#343844] dark:hover:border-[#f3f0ea]"
                 >
                   Next
@@ -326,11 +435,11 @@ function App() {
             <aside className="border-t border-[#ded8cf] bg-[#f2eee8] dark:border-[#292c35] dark:bg-[#11131a] lg:border-l lg:border-t-0">
               <div className="border-b border-[#ded8cf] px-5 py-4 dark:border-[#292c35]">
                 <p className="font-mono text-xs uppercase tracking-[0.24em] text-[#77716b] dark:text-[#a6a29b]">
-                  Index
+                  Study queue
                 </p>
               </div>
               <div className="grid max-h-[620px] grid-cols-2 overflow-auto">
-                {filteredCards.map((card, index) => (
+                {pendingLearnCards.map((card, index) => (
                   <button
                     type="button"
                     key={card.id}
@@ -349,6 +458,9 @@ function App() {
                     </span>
                     <span className="font-vietnamese mt-1 block text-xs">
                       {card.hanViet}
+                    </span>
+                    <span className="mt-2 block font-mono text-[0.62rem] uppercase tracking-[0.18em] opacity-65">
+                      {statuses[card.id] === 'learning' ? 'Learning' : 'New'}
                     </span>
                   </button>
                 ))}
@@ -379,7 +491,7 @@ function App() {
                       <p className="font-mono text-xs uppercase tracking-[0.3em] text-[#9b2f2f] dark:text-[#e3a66d]">
                         Write Han Viet
                       </p>
-                      <div className="font-kanji mt-6 text-[9rem] font-black leading-none md:text-[12rem]">
+                      <div className="font-kanji mt-6 text-[9rem] font-bold leading-none md:text-[12rem]">
                         {currentTestCard.kanji}
                       </div>
 
@@ -389,7 +501,7 @@ function App() {
                           onChange={(event) => setAnswer(event.target.value)}
                           disabled={Boolean(feedback)}
                           autoFocus
-                          placeholder="Example: nhất"
+                          placeholder="Example: nhat"
                           className="h-14 w-full border border-[#d8d1c7] bg-white px-5 text-center text-xl outline-none transition placeholder:text-[#9b948c] focus:border-[#16171d] disabled:opacity-70 dark:border-[#343844] dark:bg-[#14161d] dark:placeholder:text-[#746f6b] dark:focus:border-[#f3f0ea]"
                         />
                         <button
@@ -438,7 +550,7 @@ function App() {
                         onClick={() => resetTest()}
                         className="border border-[#16171d] bg-[#16171d] px-5 py-3 text-sm font-semibold text-white transition hover:bg-[#2a2c34] dark:border-[#f3f0ea] dark:bg-[#f3f0ea] dark:text-[#101116]"
                       >
-                        Test all again
+                        Test active queue
                       </button>
                       <button
                         type="button"
