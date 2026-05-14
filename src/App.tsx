@@ -1,30 +1,28 @@
-import { useEffect, useMemo, useState } from 'react'
-import type { FormEvent } from 'react'
-import kanjiCsv from '../kanji.csv?raw'
+import { useEffect, useMemo, useRef, useState } from 'react'
+import type { FormEvent, PointerEvent } from 'react'
 
 type KanjiCard = {
-  id: number
+  id: string
   kanji: string
   hanViet: string
+  meaning: string
+}
+
+type Lesson = {
+  id: string
+  name: string
+  fileName: string
+  cards: KanjiCard[]
 }
 
 type Mode = 'learn' | 'test'
 type CardStatus = 'new' | 'learning' | 'known'
 
-const parseKanjiCsv = (csv: string): KanjiCard[] =>
-  csv
-    .trim()
-    .split(/\r?\n/)
-    .slice(1)
-    .map((line, index) => {
-      const [kanji, ...rest] = line.split(',')
-      return {
-        id: index,
-        kanji: kanji.trim(),
-        hanViet: rest.join(',').trim(),
-      }
-    })
-    .filter((card) => card.kanji && card.hanViet)
+const csvModules = import.meta.glob('../lesson/*.csv', {
+  eager: true,
+  import: 'default',
+  query: '?raw',
+}) as Record<string, string>
 
 const stripVietnameseTone = (value: string) =>
   value
@@ -32,11 +30,117 @@ const stripVietnameseTone = (value: string) =>
     .replace(/[\u0300-\u036f]/g, '')
     .replace(/[\u0111\u0110]/g, 'd')
     .toLowerCase()
-    .replace(/[^a-z0-9\s-]/g, ' ')
+    .replace(/[-_]+/g, ' ')
+    .replace(/[^a-z0-9\s]/g, ' ')
     .replace(/\s+/g, ' ')
     .trim()
 
-const shuffleCards = (cards: KanjiCard[]) => {
+const normalizeHeader = (value: string) =>
+  stripVietnameseTone(value).replace(/[^a-z0-9]/g, '')
+
+const parseCsvRows = (csv: string) => {
+  const rows: string[][] = []
+  let row: string[] = []
+  let cell = ''
+  let inQuotes = false
+
+  for (let index = 0; index < csv.length; index += 1) {
+    const char = csv[index]
+    const nextChar = csv[index + 1]
+
+    if (char === '"') {
+      if (inQuotes && nextChar === '"') {
+        cell += '"'
+        index += 1
+      } else {
+        inQuotes = !inQuotes
+      }
+      continue
+    }
+
+    if (char === ',' && !inQuotes) {
+      row.push(cell.trim())
+      cell = ''
+      continue
+    }
+
+    if ((char === '\n' || char === '\r') && !inQuotes) {
+      if (char === '\r' && nextChar === '\n') index += 1
+      row.push(cell.trim())
+      if (row.some(Boolean)) rows.push(row)
+      row = []
+      cell = ''
+      continue
+    }
+
+    cell += char
+  }
+
+  row.push(cell.trim())
+  if (row.some(Boolean)) rows.push(row)
+
+  return rows
+}
+
+const parseKanjiCsv = (csv: string, lessonId: string): KanjiCard[] => {
+  const rows = parseCsvRows(csv)
+  if (!rows.length) return []
+
+  const headers = rows[0].map(normalizeHeader)
+  const hasHeader = headers.includes('kanji') || headers.includes('hanviet')
+  const kanjiIndex = hasHeader ? headers.indexOf('kanji') : 0
+  const hanVietIndex = hasHeader ? headers.indexOf('hanviet') : 1
+  const meaningIndex = hasHeader
+    ? headers.findIndex((header) =>
+        ['nghia', 'meaning', 'meanings'].includes(header),
+      )
+    : 2
+  const dataRows = hasHeader ? rows.slice(1) : rows
+  const safeKanjiIndex = kanjiIndex >= 0 ? kanjiIndex : 0
+  const safeHanVietIndex = hanVietIndex >= 0 ? hanVietIndex : 1
+  const safeMeaningIndex = meaningIndex >= 0 ? meaningIndex : 2
+
+  return dataRows
+    .map((row, index) => ({
+      id: `${lessonId}-${index}`,
+      kanji: row[safeKanjiIndex]?.trim() ?? '',
+      hanViet: row[safeHanVietIndex]?.trim() ?? '',
+      meaning: row[safeMeaningIndex]?.trim() ?? '',
+    }))
+    .filter((card) => card.kanji && card.hanViet)
+}
+
+const getFileName = (path: string) => path.split('/').pop() ?? path
+
+const getLessonName = (fileName: string) =>
+  fileName
+    .replace(/\.csv$/i, '')
+    .replace(/[-_]+/g, ' ')
+    .trim()
+
+const lessons: Lesson[] = Object.entries(csvModules)
+  .map(([path, csv]) => {
+    const fileName = getFileName(path)
+    const id = fileName.replace(/\.csv$/i, '')
+
+    return {
+      id,
+      name: getLessonName(fileName),
+      fileName,
+      cards: parseKanjiCsv(csv, id),
+    }
+  })
+  .filter((lesson) => lesson.cards.length)
+  .sort((a, b) =>
+    a.name.localeCompare(b.name, undefined, {
+      numeric: true,
+      sensitivity: 'base',
+    }),
+  )
+
+const emptyCards: KanjiCard[] = []
+
+const shuffleCards = <T,>(cards: T[]) => {
   const shuffled = [...cards]
   for (let index = shuffled.length - 1; index > 0; index -= 1) {
     const nextIndex = Math.floor(Math.random() * (index + 1))
@@ -48,7 +152,18 @@ const shuffleCards = (cards: KanjiCard[]) => {
   return shuffled
 }
 
-const cards = parseKanjiCsv(kanjiCsv)
+const getProgressKey = (lessonId: string) => `kanji-progress:${lessonId}`
+
+const getSavedStatuses = (lessonId: string): Record<string, CardStatus> => {
+  try {
+    const savedStatuses = localStorage.getItem(getProgressKey(lessonId))
+    return savedStatuses
+      ? (JSON.parse(savedStatuses) as Record<string, CardStatus>)
+      : {}
+  } catch {
+    return {}
+  }
+}
 
 const getInitialTheme = () => {
   const savedTheme = localStorage.getItem('kanji-theme')
@@ -57,39 +172,51 @@ const getInitialTheme = () => {
   return window.matchMedia('(prefers-color-scheme: dark)').matches
 }
 
-const getInitialStatuses = (): Record<number, CardStatus> => {
-  const savedStatuses = localStorage.getItem('kanji-progress')
-  return savedStatuses
-    ? (JSON.parse(savedStatuses) as Record<number, CardStatus>)
-    : {}
+const getInitialLessonId = () => {
+  const savedLessonId = localStorage.getItem('kanji-active-lesson')
+  const savedLesson = lessons.find((lesson) => lesson.id === savedLessonId)
+
+  return savedLesson?.id ?? lessons[0]?.id ?? ''
 }
 
 function App() {
   const [mode, setMode] = useState<Mode>('learn')
   const [isDark, setIsDark] = useState(getInitialTheme)
+  const [lessonId, setLessonId] = useState(getInitialLessonId)
+  const activeLesson = useMemo(
+    () => lessons.find((lesson) => lesson.id === lessonId) ?? lessons[0],
+    [lessonId],
+  )
+  const cards = activeLesson?.cards ?? emptyCards
   const [query, setQuery] = useState('')
   const [currentIndex, setCurrentIndex] = useState(0)
   const [isFlipped, setIsFlipped] = useState(false)
-  const [statuses, setStatuses] = useState<Record<number, CardStatus>>(
-    getInitialStatuses,
+  const [statuses, setStatuses] = useState<Record<string, CardStatus>>(() =>
+    activeLesson ? getSavedStatuses(activeLesson.id) : {},
   )
   const [learnQueue, setLearnQueue] = useState<KanjiCard[]>(() =>
     shuffleCards(cards),
   )
-  const [testQueue, setTestQueue] = useState<KanjiCard[]>(() => shuffleCards(cards))
+  const [testQueue, setTestQueue] = useState<KanjiCard[]>(() =>
+    shuffleCards(cards),
+  )
   const [testIndex, setTestIndex] = useState(0)
   const [answer, setAnswer] = useState('')
   const [feedback, setFeedback] = useState<'correct' | 'wrong' | null>(null)
   const [score, setScore] = useState({ correct: 0, total: 0 })
   const [missed, setMissed] = useState<KanjiCard[]>([])
+  const swipeStartRef = useRef({ x: 0, y: 0 })
+  const didSwipeRef = useRef(false)
+  const [swipeDelta, setSwipeDelta] = useState(0)
 
   useEffect(() => {
     localStorage.setItem('kanji-theme', isDark ? 'dark' : 'light')
   }, [isDark])
 
   useEffect(() => {
-    localStorage.setItem('kanji-progress', JSON.stringify(statuses))
-  }, [statuses])
+    if (!activeLesson) return
+    localStorage.setItem(getProgressKey(activeLesson.id), JSON.stringify(statuses))
+  }, [activeLesson, statuses])
 
   const filteredCards = useMemo(() => {
     const normalizedQuery = stripVietnameseTone(query)
@@ -101,7 +228,7 @@ function App() {
         stripVietnameseTone(card.hanViet).includes(normalizedQuery)
       )
     })
-  }, [query])
+  }, [cards, query])
 
   const filteredCardIds = useMemo(
     () => new Set(filteredCards.map((card) => card.id)),
@@ -116,18 +243,10 @@ function App() {
     [filteredCardIds, learnQueue, statuses],
   )
 
-  useEffect(() => {
-    setCurrentIndex((index) =>
-      pendingLearnCards.length
-        ? Math.min(index, pendingLearnCards.length - 1)
-        : 0,
-    )
-  }, [pendingLearnCards.length])
-
   const effectiveIndex = pendingLearnCards.length
     ? Math.min(currentIndex, pendingLearnCards.length - 1)
     : 0
-  const currentCard = pendingLearnCards[effectiveIndex] ?? cards[0]
+  const currentCard = pendingLearnCards[effectiveIndex]
   const currentTestCard = testQueue[testIndex]
   const knownCount = cards.filter((card) => statuses[card.id] === 'known').length
   const learningCount = cards.filter(
@@ -135,10 +254,32 @@ function App() {
   ).length
   const testFinished = testIndex >= testQueue.length
   const accuracy = score.total ? Math.round((score.correct / score.total) * 100) : 0
-  const progressPercent = cards.length ? Math.round((knownCount / cards.length) * 100) : 0
+  const progressPercent = cards.length
+    ? Math.round((knownCount / cards.length) * 100)
+    : 0
 
   const setCardStatus = (card: KanjiCard, status: CardStatus) => {
     setStatuses((previous) => ({ ...previous, [card.id]: status }))
+  }
+
+  const chooseLesson = (nextLessonId: string) => {
+    const nextLesson = lessons.find((lesson) => lesson.id === nextLessonId)
+    if (!nextLesson) return
+
+    localStorage.setItem('kanji-active-lesson', nextLesson.id)
+    setLessonId(nextLesson.id)
+    setStatuses(getSavedStatuses(nextLesson.id))
+    setLearnQueue(shuffleCards(nextLesson.cards))
+    setTestQueue(shuffleCards(nextLesson.cards))
+    setQuery('')
+    setCurrentIndex(0)
+    setIsFlipped(false)
+    setTestIndex(0)
+    setAnswer('')
+    setFeedback(null)
+    setScore({ correct: 0, total: 0 })
+    setMissed([])
+    setMode('learn')
   }
 
   const moveCard = (direction: 1 | -1) => {
@@ -158,24 +299,70 @@ function App() {
     setIsFlipped(false)
   }
 
-  const markStillLearning = (card: KanjiCard) => {
-    setCardStatus(card, 'learning')
-    setLearnQueue((queue) => {
-      const remaining = queue.filter((item) => item.id !== card.id)
-      const insertAt = Math.min(currentIndex + 4, remaining.length)
+  const markNotLearned = (card?: KanjiCard) => {
+    if (!card) return
 
-      return [
-        ...remaining.slice(0, insertAt),
-        card,
-        ...remaining.slice(insertAt),
-      ]
-    })
+    const wasLastVisibleCard =
+      pendingLearnCards[pendingLearnCards.length - 1]?.id === card.id
+
+    setCardStatus(card, 'learning')
+    setLearnQueue((queue) => [
+      ...queue.filter((item) => item.id !== card.id),
+      card,
+    ])
+    setCurrentIndex(wasLastVisibleCard ? 0 : effectiveIndex)
     setIsFlipped(false)
   }
 
-  const markKnown = (card: KanjiCard) => {
+  const markKnown = (card?: KanjiCard) => {
+    if (!card) return
+
     setCardStatus(card, 'known')
     setIsFlipped(false)
+  }
+
+  const startCardSwipe = (event: PointerEvent<HTMLButtonElement>) => {
+    if (!currentCard || event.pointerType === 'mouse') return
+
+    swipeStartRef.current = { x: event.clientX, y: event.clientY }
+    didSwipeRef.current = false
+    setSwipeDelta(0)
+    event.currentTarget.setPointerCapture(event.pointerId)
+  }
+
+  const trackCardSwipe = (event: PointerEvent<HTMLButtonElement>) => {
+    if (!currentCard || event.pointerType === 'mouse') return
+
+    const nextDelta = event.clientX - swipeStartRef.current.x
+    setSwipeDelta(Math.max(-96, Math.min(96, nextDelta)))
+  }
+
+  const finishCardSwipe = (event: PointerEvent<HTMLButtonElement>) => {
+    if (!currentCard || event.pointerType === 'mouse') return
+
+    const deltaX = event.clientX - swipeStartRef.current.x
+    const deltaY = event.clientY - swipeStartRef.current.y
+    const isHorizontalSwipe = Math.abs(deltaX) > 72 && Math.abs(deltaX) > Math.abs(deltaY) * 1.2
+
+    if (isHorizontalSwipe) {
+      didSwipeRef.current = true
+      if (deltaX < 0) {
+        markNotLearned(currentCard)
+      } else {
+        markKnown(currentCard)
+      }
+    }
+
+    setSwipeDelta(0)
+  }
+
+  const flipCurrentCard = () => {
+    if (didSwipeRef.current) {
+      didSwipeRef.current = false
+      return
+    }
+
+    setIsFlipped((value) => !value)
   }
 
   const restartLearning = () => {
@@ -189,7 +376,7 @@ function App() {
     const activeCards = cards.filter((card) => statuses[card.id] !== 'known')
     const sourceCards = pool ?? (activeCards.length ? activeCards : cards)
 
-    setTestQueue(shuffleCards(sourceCards.length ? sourceCards : cards))
+    setTestQueue(shuffleCards(sourceCards))
     setTestIndex(0)
     setAnswer('')
     setFeedback(null)
@@ -229,27 +416,47 @@ function App() {
     setFeedback(null)
   }
 
+  if (!activeLesson) {
+    return (
+      <main
+        className={`${isDark ? 'dark' : ''} grid min-h-screen place-items-center bg-[#fbf9f7] px-5 text-[#16171d] dark:bg-[#101116] dark:text-[#f3f0ea]`}
+      >
+        <div className="max-w-xl border border-[#ded8cf] bg-[#fffdf9] p-6 text-center dark:border-[#292c35] dark:bg-[#14161d]">
+          <p className="font-mono text-xs uppercase tracking-[0.24em] text-[#9b2f2f] dark:text-[#e3a66d]">
+            No lessons found
+          </p>
+          <h1 className="font-vietnamese mt-4 text-3xl font-bold">
+            Add CSV files to the lesson folder.
+          </h1>
+          <p className="mt-3 text-sm text-[#625d57] dark:text-[#bab5ad]">
+            Each file should include Kanji and HanViet columns.
+          </p>
+        </div>
+      </main>
+    )
+  }
+
   return (
     <main
       className={`${isDark ? 'dark' : ''} min-h-screen bg-[#fbf9f7] text-[#16171d] transition-colors dark:bg-[#101116] dark:text-[#f3f0ea]`}
     >
-      <div className="mx-auto flex min-h-screen w-full max-w-7xl flex-col border-x border-[#ded8cf] bg-[#fffdf9]/80 shadow-[0_24px_80px_rgba(22,23,29,0.08)] backdrop-blur dark:border-[#292c35] dark:bg-[#14161d]/86">
+      <div className="mx-auto flex min-h-screen w-full max-w-7xl flex-col bg-[#fffdf9]/80 shadow-[0_24px_80px_rgba(22,23,29,0.08)] backdrop-blur dark:bg-[#14161d]/86 md:border-x md:border-[#ded8cf] md:dark:border-[#292c35]">
         <header className="sticky top-0 z-20 border-b border-[#ded8cf] bg-[#fffdf9]/92 backdrop-blur dark:border-[#292c35] dark:bg-[#14161d]/92">
-          <div className="flex flex-col gap-4 px-5 py-4 md:flex-row md:items-center md:justify-between md:px-8">
+          <div className="flex flex-col gap-4 px-4 py-4 sm:px-5 md:flex-row md:items-center md:justify-between md:px-8">
             <div>
-              <p className="font-mono text-xs uppercase tracking-[0.28em] text-[#9b2f2f] dark:text-[#e3a66d]">
+              <p className="font-mono text-[0.65rem] uppercase tracking-[0.2em] text-[#9b2f2f] dark:text-[#e3a66d] sm:text-xs sm:tracking-[0.28em]">
                 Kanji Memory Desk
               </p>
-              <h1 className="mt-1 font-vietnamese text-3xl font-bold leading-tight md:text-4xl">
+              <h1 className="mt-1 font-vietnamese text-2xl font-bold leading-tight sm:text-3xl md:text-4xl">
                 Han Viet recall trainer
               </h1>
             </div>
 
-            <div className="flex flex-wrap items-center gap-2">
+            <div className="grid grid-cols-3 gap-2 sm:flex sm:flex-wrap sm:items-center">
               <button
                 type="button"
                 onClick={() => setMode('learn')}
-                className={`rounded-none border px-4 py-2 text-sm font-semibold transition ${
+                className={`min-h-11 border px-3 text-sm font-semibold transition sm:px-4 ${
                   mode === 'learn'
                     ? 'border-[#16171d] bg-[#16171d] text-white dark:border-[#f3f0ea] dark:bg-[#f3f0ea] dark:text-[#101116]'
                     : 'border-[#ded8cf] bg-transparent hover:border-[#16171d] dark:border-[#343844] dark:hover:border-[#f3f0ea]'
@@ -260,7 +467,8 @@ function App() {
               <button
                 type="button"
                 onClick={() => resetTest()}
-                className={`rounded-none border px-4 py-2 text-sm font-semibold transition ${
+                disabled={!cards.length}
+                className={`min-h-11 border px-3 text-sm font-semibold transition disabled:cursor-not-allowed disabled:opacity-45 sm:px-4 ${
                   mode === 'test'
                     ? 'border-[#16171d] bg-[#16171d] text-white dark:border-[#f3f0ea] dark:bg-[#f3f0ea] dark:text-[#101116]'
                     : 'border-[#ded8cf] bg-transparent hover:border-[#16171d] dark:border-[#343844] dark:hover:border-[#f3f0ea]'
@@ -271,7 +479,7 @@ function App() {
               <button
                 type="button"
                 onClick={() => setIsDark((value) => !value)}
-                className="rounded-none border border-[#ded8cf] px-4 py-2 text-sm font-semibold transition hover:border-[#16171d] dark:border-[#343844] dark:hover:border-[#f3f0ea]"
+                className="min-h-11 border border-[#ded8cf] px-3 text-sm font-semibold transition hover:border-[#16171d] dark:border-[#343844] dark:hover:border-[#f3f0ea] sm:px-4"
               >
                 {isDark ? 'Light' : 'Dark'}
               </button>
@@ -279,13 +487,31 @@ function App() {
           </div>
         </header>
 
-        <section className="grid gap-0 border-b border-[#ded8cf] dark:border-[#292c35] lg:grid-cols-[1.4fr_0.9fr]">
-          <div className="border-b border-[#ded8cf] px-5 py-6 dark:border-[#292c35] md:px-8 lg:border-b-0 lg:border-r">
+        <section className="grid gap-0 border-b border-[#ded8cf] dark:border-[#292c35] lg:grid-cols-[1.35fr_0.9fr]">
+          <div className="border-b border-[#ded8cf] px-4 py-5 dark:border-[#292c35] sm:px-5 md:px-8 lg:border-b-0 lg:border-r">
             <div className="max-w-3xl">
-              <p className="font-mono text-xs uppercase tracking-[0.28em] text-[#77716b] dark:text-[#a6a29b]">
-                {cards.length} characters from kanji.csv
+              <label
+                htmlFor="lesson"
+                className="font-mono text-[0.65rem] uppercase tracking-[0.2em] text-[#77716b] dark:text-[#a6a29b] sm:text-xs sm:tracking-[0.28em]"
+              >
+                Lesson
+              </label>
+              <select
+                id="lesson"
+                value={activeLesson.id}
+                onChange={(event) => chooseLesson(event.target.value)}
+                className="mt-3 h-12 w-full border border-[#d8d1c7] bg-white px-4 text-base font-semibold outline-none transition focus:border-[#16171d] dark:border-[#343844] dark:bg-[#101116] dark:focus:border-[#f3f0ea] sm:max-w-sm"
+              >
+                {lessons.map((lesson) => (
+                  <option key={lesson.id} value={lesson.id}>
+                    {lesson.name}
+                  </option>
+                ))}
+              </select>
+              <p className="mt-4 font-mono text-xs uppercase tracking-[0.2em] text-[#77716b] dark:text-[#a6a29b]">
+                {cards.length} characters from {activeLesson.fileName}
               </p>
-              <h2 className="mt-4 font-vietnamese text-4xl font-bold leading-[1.04] md:text-6xl">
+              <h2 className="mt-4 font-vietnamese text-[2.35rem] font-bold leading-[1.04] sm:text-5xl md:text-6xl">
                 Remember the character first. Recall the Vietnamese reading next.
               </h2>
             </div>
@@ -300,21 +526,21 @@ function App() {
 
         {mode === 'learn' ? (
           <section className="grid flex-1 gap-0 lg:grid-cols-[minmax(0,1fr)_360px]">
-            <div className="flex min-h-[560px] flex-col px-5 py-6 md:px-8">
+            <div className="flex min-h-[calc(100svh-320px)] flex-col px-4 py-5 sm:px-5 md:px-8 md:py-6 lg:min-h-[560px]">
               <div className="mb-5 flex flex-col gap-3 md:flex-row md:items-center md:justify-between">
                 <div>
                   <p className="font-mono text-xs uppercase tracking-[0.24em] text-[#77716b] dark:text-[#a6a29b]">
                     Learn mode
                   </p>
                   <p className="mt-1 text-sm text-[#625d57] dark:text-[#bab5ad]">
-                    Shuffled review keeps missed cards in rotation until learned.
+                    Not learned cards move to the back of the queue.
                   </p>
                 </div>
-                <div className="flex w-full flex-col gap-2 sm:flex-row md:w-auto">
+                <div className="grid w-full grid-cols-1 gap-2 sm:grid-cols-[auto_1fr] md:w-auto">
                   <button
                     type="button"
                     onClick={shuffleLearning}
-                    className="h-11 border border-[#ded8cf] px-4 text-sm font-semibold transition hover:border-[#16171d] dark:border-[#343844] dark:hover:border-[#f3f0ea]"
+                    className="min-h-11 border border-[#ded8cf] px-4 text-sm font-semibold transition hover:border-[#16171d] dark:border-[#343844] dark:hover:border-[#f3f0ea]"
                   >
                     Shuffle
                   </button>
@@ -326,66 +552,81 @@ function App() {
                       setIsFlipped(false)
                     }}
                     placeholder="Search kanji or Han Viet"
-                    className="h-11 w-full border border-[#d8d1c7] bg-white px-4 text-sm outline-none transition placeholder:text-[#9b948c] focus:border-[#16171d] dark:border-[#343844] dark:bg-[#101116] dark:placeholder:text-[#746f6b] dark:focus:border-[#f3f0ea] md:w-72"
+                    className="min-h-11 w-full border border-[#d8d1c7] bg-white px-4 text-base outline-none transition placeholder:text-[#9b948c] focus:border-[#16171d] dark:border-[#343844] dark:bg-[#101116] dark:placeholder:text-[#746f6b] dark:focus:border-[#f3f0ea] md:w-72"
                   />
                 </div>
               </div>
 
-              {pendingLearnCards.length ? (
+              {pendingLearnCards.length && currentCard ? (
                 <button
                   type="button"
-                  onClick={() => setIsFlipped((value) => !value)}
-                  className="group grid min-h-[330px] flex-1 place-items-center border border-[#16171d] bg-[#fbf9f7] px-6 py-10 text-center transition hover:bg-white dark:border-[#f3f0ea] dark:bg-[#101116] dark:hover:bg-[#171a22]"
+                  onClick={flipCurrentCard}
+                  onPointerDown={startCardSwipe}
+                  onPointerMove={trackCardSwipe}
+                  onPointerUp={finishCardSwipe}
+                  onPointerCancel={() => setSwipeDelta(0)}
+                  style={{
+                    transform: `translateX(${swipeDelta}px)`,
+                  }}
+                  className={`group grid min-h-[280px] flex-1 touch-pan-y place-items-center border border-[#16171d] bg-[#fbf9f7] px-4 py-8 text-center transition hover:bg-white dark:border-[#f3f0ea] dark:bg-[#101116] dark:hover:bg-[#171a22] sm:px-6 md:min-h-[330px] ${
+                    swipeDelta < -24
+                      ? 'border-[#c9a44a] bg-[#fff7df] dark:bg-[#2a2415]'
+                      : swipeDelta > 24
+                        ? 'border-[#1f6f54] bg-[#e7f6ed] dark:bg-[#13251e]'
+                        : ''
+                  }`}
                 >
-                  <div>
-                    <p className="font-mono text-xs uppercase tracking-[0.3em] text-[#9b2f2f] dark:text-[#e3a66d]">
+                  <div className="min-w-0">
+                    <p className="font-mono text-[0.65rem] uppercase tracking-[0.24em] text-[#9b2f2f] dark:text-[#e3a66d] sm:text-xs sm:tracking-[0.3em]">
                       Queue {effectiveIndex + 1} of {pendingLearnCards.length}
                     </p>
                     <div
-                      className={`mt-6 leading-none ${
+                      className={`mt-6 break-words leading-none ${
                         isFlipped
-                          ? 'font-vietnamese text-6xl font-bold md:text-8xl'
-                          : 'font-kanji text-[8rem] font-bold md:text-[11rem]'
+                          ? 'font-vietnamese text-[clamp(3rem,14vw,5.5rem)] font-bold'
+                          : 'font-kanji text-[clamp(5.5rem,34vw,11rem)] font-bold'
                       }`}
                     >
                       {isFlipped ? currentCard.hanViet : currentCard.kanji}
                     </div>
-                    <p className="mt-7 text-sm text-[#625d57] dark:text-[#bab5ad]">
-                      {isFlipped ? (
-                        <span className="font-kanji">{currentCard.kanji}</span>
-                      ) : (
-                        'Reveal Han Viet'
-                      )}
+                    {isFlipped && currentCard.meaning ? (
+                      <p className="mx-auto mt-4 max-w-xl text-base font-semibold leading-relaxed text-[#625d57] dark:text-[#bab5ad] sm:text-lg">
+                        {currentCard.meaning}
+                      </p>
+                    ) : null}
+                    
+                    <p className="mt-4 font-mono text-[0.62rem] uppercase tracking-[0.18em] text-[#8a837b] dark:text-[#8f8b86]">
+                      Swipe left: not learned / right: know it
                     </p>
                   </div>
                 </button>
               ) : (
-                <div className="grid min-h-[330px] flex-1 place-items-center border border-[#16171d] bg-[#fbf9f7] px-6 py-10 text-center dark:border-[#f3f0ea] dark:bg-[#101116]">
+                <div className="grid min-h-[280px] flex-1 place-items-center border border-[#16171d] bg-[#fbf9f7] px-4 py-8 text-center dark:border-[#f3f0ea] dark:bg-[#101116] sm:px-6 md:min-h-[330px]">
                   <div className="max-w-xl">
                     <p className="font-mono text-xs uppercase tracking-[0.3em] text-[#9b2f2f] dark:text-[#e3a66d]">
                       Learning complete
                     </p>
-                    <h2 className="font-vietnamese mt-5 text-5xl font-bold leading-tight">
+                    <h2 className="font-vietnamese mt-5 text-3xl font-bold leading-tight sm:text-5xl">
                       {filteredCards.length
-                        ? 'You learned every card in this set.'
+                        ? 'You learned every card in this lesson.'
                         : 'No cards match this search.'}
                     </h2>
                     <p className="mt-4 text-[#625d57] dark:text-[#bab5ad]">
-                      Known cards leave the learning queue. Cards marked still
-                      learning come back later until you mark them known.
+                      Known cards leave the learning queue. Not learned cards
+                      return to the end of the queue.
                     </p>
                     <div className="mt-7 grid gap-3 sm:grid-cols-2">
                       <button
                         type="button"
                         onClick={() => setQuery('')}
-                        className="border border-[#ded8cf] px-5 py-3 text-sm font-semibold transition hover:border-[#16171d] dark:border-[#343844] dark:hover:border-[#f3f0ea]"
+                        className="min-h-12 border border-[#ded8cf] px-5 text-sm font-semibold transition hover:border-[#16171d] dark:border-[#343844] dark:hover:border-[#f3f0ea]"
                       >
                         Clear search
                       </button>
                       <button
                         type="button"
                         onClick={restartLearning}
-                        className="border border-[#16171d] bg-[#16171d] px-5 py-3 text-sm font-semibold text-white transition hover:bg-[#2a2c34] dark:border-[#f3f0ea] dark:bg-[#f3f0ea] dark:text-[#101116]"
+                        className="min-h-12 border border-[#16171d] bg-[#16171d] px-5 text-sm font-semibold text-white transition hover:bg-[#2a2c34] dark:border-[#f3f0ea] dark:bg-[#f3f0ea] dark:text-[#101116]"
                       >
                         Study all again
                       </button>
@@ -399,24 +640,24 @@ function App() {
                   type="button"
                   onClick={() => moveCard(-1)}
                   disabled={!pendingLearnCards.length}
-                  className="border border-[#ded8cf] px-5 py-3 text-sm font-semibold transition hover:border-[#16171d] dark:border-[#343844] dark:hover:border-[#f3f0ea]"
+                  className="min-h-12 border border-[#ded8cf] px-5 text-sm font-semibold transition hover:border-[#16171d] disabled:cursor-not-allowed disabled:opacity-45 dark:border-[#343844] dark:hover:border-[#f3f0ea]"
                 >
                   Previous
                 </button>
-                <div className="grid grid-cols-2 gap-3">
+                <div className="grid grid-cols-1 gap-3 sm:grid-cols-2">
                   <button
                     type="button"
-                    onClick={() => markStillLearning(currentCard)}
+                    onClick={() => markNotLearned(currentCard)}
                     disabled={!pendingLearnCards.length}
-                    className="border border-[#c9a44a] bg-[#fff7df] px-5 py-3 text-sm font-semibold text-[#6f5210] transition hover:bg-[#ffefbd] dark:border-[#806729] dark:bg-[#2a2415] dark:text-[#f2d27d]"
+                    className="min-h-12 border border-[#c9a44a] bg-[#fff7df] px-5 text-sm font-semibold text-[#6f5210] transition hover:bg-[#ffefbd] disabled:cursor-not-allowed disabled:opacity-45 dark:border-[#806729] dark:bg-[#2a2415] dark:text-[#f2d27d]"
                   >
-                    Still learning
+                    Not learned
                   </button>
                   <button
                     type="button"
                     onClick={() => markKnown(currentCard)}
                     disabled={!pendingLearnCards.length}
-                    className="border border-[#1f6f54] bg-[#e7f6ed] px-5 py-3 text-sm font-semibold text-[#17523f] transition hover:bg-[#d4f0df] dark:border-[#39765f] dark:bg-[#13251e] dark:text-[#aee6cd]"
+                    className="min-h-12 border border-[#1f6f54] bg-[#e7f6ed] px-5 text-sm font-semibold text-[#17523f] transition hover:bg-[#d4f0df] disabled:cursor-not-allowed disabled:opacity-45 dark:border-[#39765f] dark:bg-[#13251e] dark:text-[#aee6cd]"
                   >
                     I know this
                   </button>
@@ -425,7 +666,7 @@ function App() {
                   type="button"
                   onClick={() => moveCard(1)}
                   disabled={!pendingLearnCards.length}
-                  className="border border-[#ded8cf] px-5 py-3 text-sm font-semibold transition hover:border-[#16171d] dark:border-[#343844] dark:hover:border-[#f3f0ea]"
+                  className="min-h-12 border border-[#ded8cf] px-5 text-sm font-semibold transition hover:border-[#16171d] disabled:cursor-not-allowed disabled:opacity-45 dark:border-[#343844] dark:hover:border-[#f3f0ea]"
                 >
                   Next
                 </button>
@@ -433,12 +674,12 @@ function App() {
             </div>
 
             <aside className="border-t border-[#ded8cf] bg-[#f2eee8] dark:border-[#292c35] dark:bg-[#11131a] lg:border-l lg:border-t-0">
-              <div className="border-b border-[#ded8cf] px-5 py-4 dark:border-[#292c35]">
+              <div className="border-b border-[#ded8cf] px-4 py-4 dark:border-[#292c35] sm:px-5">
                 <p className="font-mono text-xs uppercase tracking-[0.24em] text-[#77716b] dark:text-[#a6a29b]">
                   Study queue
                 </p>
               </div>
-              <div className="grid max-h-[620px] grid-cols-2 overflow-auto">
+              <div className="grid max-h-[48svh] grid-cols-2 overflow-auto sm:grid-cols-3 lg:max-h-[620px] lg:grid-cols-2">
                 {pendingLearnCards.map((card, index) => (
                   <button
                     type="button"
@@ -447,8 +688,8 @@ function App() {
                       setCurrentIndex(index)
                       setIsFlipped(false)
                     }}
-                    className={`border-b border-r border-[#ded8cf] px-4 py-3 text-left transition dark:border-[#292c35] ${
-                      currentCard.id === card.id
+                    className={`min-h-[88px] border-b border-r border-[#ded8cf] px-3 py-3 text-left transition dark:border-[#292c35] sm:px-4 ${
+                      currentCard?.id === card.id
                         ? 'bg-[#16171d] text-white dark:bg-[#f3f0ea] dark:text-[#101116]'
                         : 'hover:bg-white dark:hover:bg-[#191c25]'
                     }`}
@@ -456,7 +697,7 @@ function App() {
                     <span className="font-kanji block text-3xl font-bold">
                       {card.kanji}
                     </span>
-                    <span className="font-vietnamese mt-1 block text-xs">
+                    <span className="font-vietnamese mt-1 block truncate text-xs">
                       {card.hanViet}
                     </span>
                     <span className="mt-2 block font-mono text-[0.62rem] uppercase tracking-[0.18em] opacity-65">
@@ -469,7 +710,7 @@ function App() {
           </section>
         ) : (
           <section className="grid flex-1 gap-0 lg:grid-cols-[minmax(0,1fr)_360px]">
-            <div className="flex min-h-[560px] flex-col px-5 py-6 md:px-8">
+            <div className="flex min-h-[calc(100svh-320px)] flex-col px-4 py-5 sm:px-5 md:px-8 md:py-6 lg:min-h-[560px]">
               {!testFinished && currentTestCard ? (
                 <>
                   <div className="mb-5 flex flex-col gap-3 md:flex-row md:items-center md:justify-between">
@@ -478,7 +719,7 @@ function App() {
                         Test mode
                       </p>
                       <p className="mt-1 text-sm text-[#625d57] dark:text-[#bab5ad]">
-                        Type the Vietnamese Han Viet reading for the kanji.
+                        Type only the Han Viet reading for the kanji.
                       </p>
                     </div>
                     <p className="font-mono text-sm text-[#625d57] dark:text-[#bab5ad]">
@@ -486,12 +727,12 @@ function App() {
                     </p>
                   </div>
 
-                  <div className="grid flex-1 place-items-center border border-[#16171d] bg-[#fbf9f7] px-6 py-10 text-center dark:border-[#f3f0ea] dark:bg-[#101116]">
+                  <div className="grid flex-1 place-items-center border border-[#16171d] bg-[#fbf9f7] px-4 py-8 text-center dark:border-[#f3f0ea] dark:bg-[#101116] sm:px-6 md:py-10">
                     <div className="w-full max-w-xl">
                       <p className="font-mono text-xs uppercase tracking-[0.3em] text-[#9b2f2f] dark:text-[#e3a66d]">
                         Write Han Viet
                       </p>
-                      <div className="font-kanji mt-6 text-[9rem] font-bold leading-none md:text-[12rem]">
+                      <div className="font-kanji mt-6 text-[clamp(6rem,38vw,12rem)] font-bold leading-none">
                         {currentTestCard.kanji}
                       </div>
 
@@ -502,12 +743,12 @@ function App() {
                           disabled={Boolean(feedback)}
                           autoFocus
                           placeholder="Example: nhat"
-                          className="h-14 w-full border border-[#d8d1c7] bg-white px-5 text-center text-xl outline-none transition placeholder:text-[#9b948c] focus:border-[#16171d] disabled:opacity-70 dark:border-[#343844] dark:bg-[#14161d] dark:placeholder:text-[#746f6b] dark:focus:border-[#f3f0ea]"
+                          className="min-h-14 w-full border border-[#d8d1c7] bg-white px-4 text-center text-lg outline-none transition placeholder:text-[#9b948c] focus:border-[#16171d] disabled:opacity-70 dark:border-[#343844] dark:bg-[#14161d] dark:placeholder:text-[#746f6b] dark:focus:border-[#f3f0ea] sm:px-5 sm:text-xl"
                         />
                         <button
                           type={feedback ? 'button' : 'submit'}
                           onClick={feedback ? nextQuestion : undefined}
-                          className="mt-4 w-full border border-[#16171d] bg-[#16171d] px-5 py-3 text-sm font-semibold text-white transition hover:bg-[#2a2c34] dark:border-[#f3f0ea] dark:bg-[#f3f0ea] dark:text-[#101116] dark:hover:bg-white"
+                          className="mt-4 min-h-12 w-full border border-[#16171d] bg-[#16171d] px-5 text-sm font-semibold text-white transition hover:bg-[#2a2c34] dark:border-[#f3f0ea] dark:bg-[#f3f0ea] dark:text-[#101116] dark:hover:bg-white"
                         >
                           {feedback ? 'Next question' : 'Check answer'}
                         </button>
@@ -515,7 +756,7 @@ function App() {
 
                       {feedback && (
                         <div
-                          className={`mt-5 border px-5 py-4 text-left ${
+                          className={`mt-5 border px-4 py-4 text-left sm:px-5 ${
                             feedback === 'correct'
                               ? 'border-[#1f6f54] bg-[#e7f6ed] text-[#17523f] dark:border-[#39765f] dark:bg-[#13251e] dark:text-[#aee6cd]'
                               : 'border-[#9b2f2f] bg-[#f8e8e5] text-[#79201f] dark:border-[#8e4942] dark:bg-[#2a1717] dark:text-[#f0b5af]'
@@ -525,7 +766,10 @@ function App() {
                             {feedback === 'correct' ? 'Correct' : 'Not quite'}
                           </p>
                           <p className="mt-1 text-sm">
-                            Answer: <span className="font-semibold">{currentTestCard.hanViet}</span>
+                            Answer:{' '}
+                            <span className="font-semibold">
+                              {currentTestCard.hanViet}
+                            </span>
                           </p>
                         </div>
                       )}
@@ -533,12 +777,12 @@ function App() {
                   </div>
                 </>
               ) : (
-                <div className="grid flex-1 place-items-center border border-[#16171d] bg-[#fbf9f7] px-6 py-10 text-center dark:border-[#f3f0ea] dark:bg-[#101116]">
+                <div className="grid flex-1 place-items-center border border-[#16171d] bg-[#fbf9f7] px-4 py-8 text-center dark:border-[#f3f0ea] dark:bg-[#101116] sm:px-6 md:py-10">
                   <div className="max-w-xl">
                     <p className="font-mono text-xs uppercase tracking-[0.3em] text-[#9b2f2f] dark:text-[#e3a66d]">
                       Test complete
                     </p>
-                    <h2 className="font-vietnamese mt-5 text-5xl font-bold leading-tight">
+                    <h2 className="font-vietnamese mt-5 text-3xl font-bold leading-tight sm:text-5xl">
                       {score.correct} correct out of {score.total}
                     </h2>
                     <p className="mt-4 text-[#625d57] dark:text-[#bab5ad]">
@@ -548,7 +792,7 @@ function App() {
                       <button
                         type="button"
                         onClick={() => resetTest()}
-                        className="border border-[#16171d] bg-[#16171d] px-5 py-3 text-sm font-semibold text-white transition hover:bg-[#2a2c34] dark:border-[#f3f0ea] dark:bg-[#f3f0ea] dark:text-[#101116]"
+                        className="min-h-12 border border-[#16171d] bg-[#16171d] px-5 text-sm font-semibold text-white transition hover:bg-[#2a2c34] dark:border-[#f3f0ea] dark:bg-[#f3f0ea] dark:text-[#101116]"
                       >
                         Test active queue
                       </button>
@@ -556,7 +800,7 @@ function App() {
                         type="button"
                         disabled={!missed.length}
                         onClick={() => resetTest(missed)}
-                        className="border border-[#ded8cf] px-5 py-3 text-sm font-semibold transition hover:border-[#16171d] disabled:cursor-not-allowed disabled:opacity-45 dark:border-[#343844] dark:hover:border-[#f3f0ea]"
+                        className="min-h-12 border border-[#ded8cf] px-5 text-sm font-semibold transition hover:border-[#16171d] disabled:cursor-not-allowed disabled:opacity-45 dark:border-[#343844] dark:hover:border-[#f3f0ea]"
                       >
                         Retry missed
                       </button>
@@ -571,17 +815,17 @@ function App() {
                 <Stat label="Score" value={`${score.correct}/${score.total}`} compact />
                 <Stat label="Accuracy" value={`${accuracy}%`} compact />
               </div>
-              <div className="px-5 py-5">
+              <div className="px-4 py-5 sm:px-5">
                 <p className="font-mono text-xs uppercase tracking-[0.24em] text-[#77716b] dark:text-[#a6a29b]">
                   Answer rules
                 </p>
                 <ul className="mt-4 space-y-3 text-sm text-[#625d57] dark:text-[#bab5ad]">
                   <li>Vietnamese accents are accepted but not required.</li>
-                  <li>Correct answers become known cards automatically.</li>
+                  <li>Only the Han Viet column is checked.</li>
                   <li>Wrong answers stay in learning for later review.</li>
                 </ul>
               </div>
-              <div className="border-t border-[#ded8cf] px-5 py-5 dark:border-[#292c35]">
+              <div className="border-t border-[#ded8cf] px-4 py-5 dark:border-[#292c35] sm:px-5">
                 <p className="font-mono text-xs uppercase tracking-[0.24em] text-[#77716b] dark:text-[#a6a29b]">
                   Missed
                 </p>
@@ -589,7 +833,7 @@ function App() {
                   {missed.slice(-12).map((card, index) => (
                     <div
                       key={`${card.id}-${index}`}
-                      className="border border-[#ded8cf] bg-white px-3 py-2 dark:border-[#292c35] dark:bg-[#171a22]"
+                      className="min-h-12 border border-[#ded8cf] bg-white px-3 py-2 dark:border-[#292c35] dark:bg-[#171a22]"
                     >
                       <span className="font-kanji text-2xl font-bold">
                         {card.kanji}
@@ -619,11 +863,11 @@ function Stat({
   compact?: boolean
 }) {
   return (
-    <div className={`${compact ? 'px-4 py-5' : 'px-5 py-8'} text-center`}>
-      <p className="font-mono text-[0.68rem] uppercase tracking-[0.22em] text-[#77716b] dark:text-[#a6a29b]">
+    <div className={`${compact ? 'px-3 py-5 sm:px-4' : 'px-3 py-6 sm:px-5 sm:py-8'} text-center`}>
+      <p className="font-mono text-[0.62rem] uppercase tracking-[0.16em] text-[#77716b] dark:text-[#a6a29b] sm:text-[0.68rem] sm:tracking-[0.22em]">
         {label}
       </p>
-      <p className="font-vietnamese mt-2 text-4xl font-bold leading-none">
+      <p className="font-vietnamese mt-2 text-2xl font-bold leading-none sm:text-4xl">
         {value}
       </p>
     </div>
